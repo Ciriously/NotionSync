@@ -6,6 +6,8 @@
  * This script runs on a daily trigger. It reads the 'Engineers'
  * roster, finds today's date, and updates the existing Notion
  * database rows with the correct 'Person' tags.
+ * * v2.1 - Uses a "sync list" based on Sync Control tab
+ * instead of a LEAVE_TERMS "block list".
  */
 
 // --- SCRIPT CONFIGURATION ---
@@ -20,14 +22,11 @@ const DESIGNATION_COL = 4; // Column D
 
 const CONTROL_SHEET_NAME = "Sync Control";
 const MAPPER_SHEET_NAME = "ID Mapper";
-
-// List of text in roster that means the person is NOT working
-const LEAVE_TERMS = ["Week Off", "EL", "NH", "COMP OFF", "#REF!"];
+const LOG_SHEET_NAME = "Shift Engg Logs";
 // --- END CONFIGURATION ---
 
 /**
  * Creates a master menu in the Google Sheet.
- * This one menu can run both the daily sync AND the setup tools.
  */
 function onOpen() {
   const ui = SpreadsheetApp.getUi();
@@ -41,6 +40,9 @@ function onOpen() {
   setupSubMenu.addItem("Find User IDs", "findUserIDs");
   setupSubMenu.addItem("Find Shift Page IDs", "findShiftPageIDs");
   menu.addSubMenu(setupSubMenu);
+
+  menu.addSeparator();
+  menu.addItem("Clear Debug Logs", "clearLogSheet");
 
   menu.addToUi();
 }
@@ -64,7 +66,11 @@ function runDailySync() {
   statusCell.setValue("Syncing...");
 
   try {
-    // 1. Load Mappers
+    // 1. Clear old logs and prepare log sheet
+    clearLogSheet();
+    Logger.log("Log sheet cleared.");
+
+    // 2. Load Mappers
     const shiftPageIdMap = loadShiftPageIdMap(controlSheet);
     if (shiftPageIdMap.size === 0) {
       throw new Error(
@@ -82,13 +88,12 @@ function runDailySync() {
     }
     Logger.log(`Loaded ${engineerIdMap.size} Engineer User IDs.`);
 
-    // 2. Get Roster Data
+    // 3. Get Roster Data
     const rosterSheet = ss.getSheetByName(ROSTER_SHEET_NAME);
     if (!rosterSheet) {
       throw new Error(`Sheet "${ROSTER_SHEET_NAME}" not found.`);
     }
 
-    // Use Utilities.formatDate, NOT SpreadsheetApp.Utilities.formatDate
     const todayStr = Utilities.formatDate(new Date(), TIMEZONE, DATE_FORMAT);
     Logger.log(`Today's date key: ${todayStr}`);
 
@@ -100,11 +105,16 @@ function runDailySync() {
     }
     Logger.log(`Found date column: ${dateColumn}`);
 
-    // 3. Process the Roster
-    const shiftData = processRoster(rosterSheet, dateColumn, engineerIdMap);
+    // 4. Process the Roster (pass shiftPageIdMap to use as a "sync list")
+    const shiftData = processRoster(
+      rosterSheet,
+      dateColumn,
+      engineerIdMap,
+      shiftPageIdMap
+    );
     Logger.log("Finished processing roster.");
 
-    // 4. Update Notion
+    // 5. Update Notion
     const { NOTION_API_KEY } = getConfig();
     let updatedCount = 0;
 
@@ -126,15 +136,55 @@ function runDailySync() {
       updatedCount++;
     }
 
-    // 5. Report Success
-    const successMsg = `Sync complete for ${todayStr}. Updated ${updatedCount} shift rows in Notion.`;
+    // 6. Report Success
+    const successMsg = `Sync complete for ${todayStr}. Updated ${updatedCount} shift rows in Notion. See "${LOG_SHEET_NAME}" for details.`;
     statusCell.setValue(successMsg);
     Logger.log(successMsg);
   } catch (e) {
-    // 6. Report Error
+    // 7. Report Error
     Logger.log(e);
     statusCell.setValue(`Error: ${e.message}`);
     SpreadsheetApp.getUi().alert(e.message);
+  }
+}
+
+/**
+ * Creates/clears the log sheet and adds headers.
+ */
+function clearLogSheet() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  let sheet = ss.getSheetByName(LOG_SHEET_NAME);
+  if (!sheet) {
+    sheet = ss.insertSheet(LOG_SHEET_NAME);
+  }
+  sheet.clear(); // Clear all old data
+  const headers = [
+    "Timestamp",
+    "Engineer Name",
+    "Designation (from Sheet)",
+    "Shift (from Sheet)",
+    "Script Action",
+  ];
+  sheet.appendRow(headers);
+  sheet.setFrozenRows(1);
+  sheet.autoResizeColumns(1, headers.length);
+}
+
+/**
+ * Appends a log message to the log sheet.
+ */
+function logToSheet(logMessage) {
+  try {
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const sheet = ss.getSheetByName(LOG_SHEET_NAME);
+    const timestamp = Utilities.formatDate(
+      new Date(),
+      TIMEZONE,
+      "yyyy-MM-dd HH:mm:ss"
+    );
+    sheet.appendRow([timestamp, ...logMessage]);
+  } catch (e) {
+    Logger.log(`Failed to write to log sheet: ${e.message}`);
   }
 }
 
@@ -166,7 +216,7 @@ function loadShiftPageIdMap(controlSheet) {
     const shiftName = row[0]; // e.g., "Shift 1"
     const pageId = row[1]; // e.g., "abc-123..."
     if (shiftName && pageId) {
-      map.set(shiftName, pageId);
+      map.set(shiftName.trim(), pageId.trim()); // Trim spaces to be safe
     }
   }
   return map;
@@ -222,8 +272,9 @@ function findDateColumn(sheet, dateStr) {
 /**
  * Loops through the roster for the given date column and sorts
  * engineers into an object grouped by shift and designation.
+ * * THIS FUNCTION IS NOW MODIFIED TO USE THE "SYNC LIST".
  */
-function processRoster(sheet, dateColumn, engineerIdMap) {
+function processRoster(sheet, dateColumn, engineerIdMap, shiftPageIdMap) {
   const numRows = sheet.getLastRow() - ROSTER_START_ROW + 1;
   if (numRows <= 0) {
     return {}; // No data rows
@@ -244,34 +295,53 @@ function processRoster(sheet, dateColumn, engineerIdMap) {
       .toString()
       .toUpperCase()
       .replace("*", ""); // "L1", "L2"
-    const shiftName = row[dateColumn - 1]; // The value in the date column, e.g., "Shift 1"
+    let shiftName = row[dateColumn - 1]; // The value in the date column, e.g., "Shift 1" or "OH"
 
-    // 1. Skip if no shift or engineer
-    if (!shiftName || !engineerName || !designation) {
+    // 1. Clean up shiftName
+    if (typeof shiftName === "string") {
+      shiftName = shiftName.trim();
+    } else {
+      shiftName = String(shiftName); // Convert numbers/other types to string
+    }
+
+    // 2. Skip if no engineer name
+    if (!engineerName) {
+      // Don't log, this is likely a blank formatting row
       continue;
     }
 
-    // 2. Skip if on leave
-    if (
-      typeof shiftName !== "string" ||
-      LEAVE_TERMS.includes(shiftName.toUpperCase())
-    ) {
+    // 3. VALIDATION: Is this a shift we sync?
+    // Check if the shiftName from the roster exists as a key in our map
+    if (!shiftPageIdMap.has(shiftName)) {
+      // It's not a valid shift (e.g., "OH", "COMP OFF", "Week Off")
+      logToSheet([
+        engineerName,
+        designation,
+        shiftName,
+        "Skipped (Shift not mapped in Sync Control)",
+      ]);
       continue;
     }
 
-    // 3. Find Notion User ID
+    // 4. Find Notion User ID (If we are here, it's a valid shift)
     const notionUserId = engineerIdMap.get(engineerName);
     if (!notionUserId) {
       Logger.log(
         `Warning: Skipping "${engineerName}" - not found in ID Mapper.`
       );
+      logToSheet([
+        engineerName,
+        designation,
+        shiftName,
+        "Skipped (No User ID in Mapper)",
+      ]);
       continue;
     }
 
-    // 4. Prepare Notion Person object
+    // 5. Prepare Notion Person object
     const notionPerson = { id: notionUserId };
 
-    // 5. Add them to the 'shifts' object
+    // 6. Add them to the 'shifts' object
     if (!shifts[shiftName]) {
       // If "Shift 1" isn't an entry yet, create it
       shifts[shiftName] = { L1: [], L2: [] };
@@ -279,8 +349,28 @@ function processRoster(sheet, dateColumn, engineerIdMap) {
 
     if (designation === "L1") {
       shifts[shiftName].L1.push(notionPerson);
+      logToSheet([
+        engineerName,
+        designation,
+        shiftName,
+        "Added to L1 bucket for " + shiftName,
+      ]);
     } else if (designation === "L2") {
       shifts[shiftName].L2.push(notionPerson);
+      logToSheet([
+        engineerName,
+        designation,
+        shiftName,
+        "Added to L2 bucket for " + shiftName,
+      ]);
+    } else {
+      // Log if designation is something other than L1/L2
+      logToSheet([
+        engineerName,
+        designation,
+        shiftName,
+        "Skipped (Designation not L1 or L2)",
+      ]);
     }
   }
   return shifts;
