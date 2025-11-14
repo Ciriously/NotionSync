@@ -6,8 +6,10 @@
  * This script runs on a daily trigger. It reads the 'Engineers'
  * roster, finds today's date, and updates the existing Notion
  * database rows with the correct 'Person' tags.
- * * v2.1 - Uses a "sync list" based on Sync Control tab
- * instead of a LEAVE_TERMS "block list".
+ *
+ * * v2.2 - Added hash-checking to prevent re-syncing unchanged data.
+ * It compares the current roster data for a day against the hash
+ * stored from the last successful sync of that same day.
  */
 
 // --- SCRIPT CONFIGURATION ---
@@ -23,6 +25,7 @@ const DESIGNATION_COL = 4; // Column D
 const CONTROL_SHEET_NAME = "Sync Control";
 const MAPPER_SHEET_NAME = "ID Mapper";
 const LOG_SHEET_NAME = "Shift Engg Logs";
+const HASH_SHEET_NAME = "Sync Hashes"; // New sheet to store hashes
 // --- END CONFIGURATION ---
 
 /**
@@ -61,7 +64,6 @@ function runDailySync() {
     return;
   }
 
-  // Set status in control panel
   const statusCell = controlSheet.getRange("B3");
   statusCell.setValue("Syncing...");
 
@@ -72,40 +74,31 @@ function runDailySync() {
 
     // 2. Load Mappers
     const shiftPageIdMap = loadShiftPageIdMap(controlSheet);
-    if (shiftPageIdMap.size === 0) {
-      throw new Error(
-        'Shift Page ID map is empty! Run the "Find Shift Page IDs" helper first.'
-      );
-    }
+    if (shiftPageIdMap.size === 0)
+      throw new Error("Shift Page ID map is empty!");
 
     const engineerIdMap = loadEngineerIdMap(
       ss.getSheetByName(MAPPER_SHEET_NAME)
     );
-    if (engineerIdMap.size === 0) {
-      throw new Error(
-        'Engineer ID map is empty! Fill out the "ID Mapper" tab.'
-      );
-    }
+    if (engineerIdMap.size === 0) throw new Error("Engineer ID map is empty!");
     Logger.log(`Loaded ${engineerIdMap.size} Engineer User IDs.`);
 
     // 3. Get Roster Data
     const rosterSheet = ss.getSheetByName(ROSTER_SHEET_NAME);
-    if (!rosterSheet) {
+    if (!rosterSheet)
       throw new Error(`Sheet "${ROSTER_SHEET_NAME}" not found.`);
-    }
 
     const todayStr = Utilities.formatDate(new Date(), TIMEZONE, DATE_FORMAT);
     Logger.log(`Today's date key: ${todayStr}`);
 
     const dateColumn = findDateColumn(rosterSheet, todayStr);
-    if (!dateColumn) {
+    if (!dateColumn)
       throw new Error(
-        `Could not find today's date "${todayStr}" in roster header (Row ${ROSTER_HEADER_ROW}). Check format.`
+        `Could not find today's date "${todayStr}" in roster header (Row ${ROSTER_HEADER_ROW}).`
       );
-    }
     Logger.log(`Found date column: ${dateColumn}`);
 
-    // 4. Process the Roster (pass shiftPageIdMap to use as a "sync list")
+    // 4. Process the Roster
     const shiftData = processRoster(
       rosterSheet,
       dateColumn,
@@ -114,16 +107,29 @@ function runDailySync() {
     );
     Logger.log("Finished processing roster.");
 
-    // 5. Update Notion
+    // 5. *** NEW HASHING LOGIC ***
+    const currentDataHash = generateDataHash(shiftData);
+    const storedHash = getStoredHash(todayStr);
+
+    if (currentDataHash === storedHash) {
+      const skipMsg = `No changes detected for ${todayStr}. Sync skipped.`;
+      Logger.log(skipMsg);
+      statusCell.setValue(skipMsg);
+      // Write to log sheet
+      logToSheet(["N/A", "N/A", "N/A", skipMsg]);
+      return; // Stop the script
+    }
+    Logger.log(
+      `New hash ${currentDataHash} does not match stored hash ${storedHash}. Proceeding with sync.`
+    );
+    // *** END HASHING LOGIC ***
+
+    // 6. Update Notion (Only runs if hashes don't match)
     const { NOTION_API_KEY } = getConfig();
     let updatedCount = 0;
 
-    // Loop through our list of shifts (from the control panel map)
     for (let [shiftName, pageId] of shiftPageIdMap.entries()) {
-      // Find the data for this shift
-      const dataForShift = shiftData[shiftName] || { L1: [], L2: [] }; // Default to empty
-
-      // Call the API to update the page
+      const dataForShift = shiftData[shiftName] || { L1: [], L2: [] };
       updateNotionPage(
         NOTION_API_KEY,
         pageId,
@@ -136,17 +142,93 @@ function runDailySync() {
       updatedCount++;
     }
 
-    // 6. Report Success
-    const successMsg = `Sync complete for ${todayStr}. Updated ${updatedCount} shift rows in Notion. See "${LOG_SHEET_NAME}" for details.`;
+    // 7. Report Success and SAVE the new hash
+    setStoredHash(todayStr, currentDataHash); // Save the new hash
+    const successMsg = `Sync complete for ${todayStr}. Updated ${updatedCount} shift rows in Notion. New hash saved.`;
     statusCell.setValue(successMsg);
     Logger.log(successMsg);
   } catch (e) {
-    // 7. Report Error
+    // 8. Report Error
     Logger.log(e);
     statusCell.setValue(`Error: ${e.message}`);
     SpreadsheetApp.getUi().alert(e.message);
   }
 }
+
+// ==================================================================
+// NEW HASHING FUNCTIONS
+// ==================================================================
+
+/**
+ * Creates/finds the Sync Hashes sheet.
+ */
+function getHashSheet() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  let sheet = ss.getSheetByName(HASH_SHEET_NAME);
+  if (!sheet) {
+    sheet = ss.insertSheet(HASH_SHEET_NAME);
+    sheet.appendRow(["Date String", "Data Hash"]);
+    sheet.setFrozenRows(1);
+  }
+  return sheet;
+}
+
+/**
+ * Generates a stable MD5 hash from the shift data object.
+ */
+function generateDataHash(shiftData) {
+  // Sort the object keys to ensure the string is always in the same order
+  const sortedKeys = Object.keys(shiftData).sort();
+  const sortedData = {};
+  for (const key of sortedKeys) {
+    sortedData[key] = shiftData[key];
+  }
+  // Convert the stable, sorted object to a JSON string
+  const dataString = JSON.stringify(sortedData);
+  // Compute the hash
+  return Utilities.computeDigest(Utilities.DigestAlgorithm.MD5, dataString)
+    .map((byte) => (byte & 0xff).toString(16).padStart(2, "0"))
+    .join("");
+}
+
+/**
+ * Finds the stored hash for a given date.
+ */
+function getStoredHash(dateStr) {
+  const sheet = getHashSheet();
+  const data = sheet.getRange("A2:B" + sheet.getLastRow()).getValues();
+  for (const row of data) {
+    if (row[0] === dateStr) {
+      return row[1]; // Found it
+    }
+  }
+  return null; // Not found
+}
+
+/**
+ * Saves a new hash for a given date, overwriting the old one.
+ */
+function setStoredHash(dateStr, hash) {
+  const sheet = getHashSheet();
+  const data = sheet.getRange("A2:B" + sheet.getLastRow()).getValues();
+  let found = false;
+  // Try to update existing row
+  for (let i = 0; i < data.length; i++) {
+    if (data[i][0] === dateStr) {
+      sheet.getRange(i + 2, 2).setValue(hash); // i+2 because data is 0-indexed and starts at row 2
+      found = true;
+      break;
+    }
+  }
+  // If not found, add a new row
+  if (!found) {
+    sheet.appendRow([dateStr, hash]);
+  }
+}
+
+// ==================================================================
+// EXISTING FUNCTIONS (No changes below this line)
+// ==================================================================
 
 /**
  * Creates/clears the log sheet and adds headers.
@@ -272,7 +354,6 @@ function findDateColumn(sheet, dateStr) {
 /**
  * Loops through the roster for the given date column and sorts
  * engineers into an object grouped by shift and designation.
- * * THIS FUNCTION IS NOW MODIFIED TO USE THE "SYNC LIST".
  */
 function processRoster(sheet, dateColumn, engineerIdMap, shiftPageIdMap) {
   const numRows = sheet.getLastRow() - ROSTER_START_ROW + 1;
@@ -311,9 +392,7 @@ function processRoster(sheet, dateColumn, engineerIdMap, shiftPageIdMap) {
     }
 
     // 3. VALIDATION: Is this a shift we sync?
-    // Check if the shiftName from the roster exists as a key in our map
     if (!shiftPageIdMap.has(shiftName)) {
-      // It's not a valid shift (e.g., "OH", "COMP OFF", "Week Off")
       logToSheet([
         engineerName,
         designation,
@@ -323,7 +402,7 @@ function processRoster(sheet, dateColumn, engineerIdMap, shiftPageIdMap) {
       continue;
     }
 
-    // 4. Find Notion User ID (If we are here, it's a valid shift)
+    // 4. Find Notion User ID
     const notionUserId = engineerIdMap.get(engineerName);
     if (!notionUserId) {
       Logger.log(
@@ -343,7 +422,6 @@ function processRoster(sheet, dateColumn, engineerIdMap, shiftPageIdMap) {
 
     // 6. Add them to the 'shifts' object
     if (!shifts[shiftName]) {
-      // If "Shift 1" isn't an entry yet, create it
       shifts[shiftName] = { L1: [], L2: [] };
     }
 
@@ -364,7 +442,6 @@ function processRoster(sheet, dateColumn, engineerIdMap, shiftPageIdMap) {
         "Added to L2 bucket for " + shiftName,
       ]);
     } else {
-      // Log if designation is something other than L1/L2
       logToSheet([
         engineerName,
         designation,
@@ -383,22 +460,21 @@ function processRoster(sheet, dateColumn, engineerIdMap, shiftPageIdMap) {
 function updateNotionPage(apiKey, pageId, l1People, l2People) {
   const url = `https://api.notion.com/v1/pages/${pageId}`;
 
-  // This payload assumes your Notion properties are named "L1" and "L2"
   const payload = {
     properties: {
       L1: {
         type: "people",
-        people: l1People, // e.g., [{id: "user-1"}, {id: "user-2"}]
+        people: l1People,
       },
       L2: {
         type: "people",
-        people: l2People, // e.g., [{id: "user-3"}]
+        people: l2People,
       },
     },
   };
 
   const options = {
-    method: "patch", // 'patch' means UPDATE, not create
+    method: "patch",
     headers: {
       Authorization: `Bearer ${apiKey}`,
       "Notion-Version": "2022-06-28",
